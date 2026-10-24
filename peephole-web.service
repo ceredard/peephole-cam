@@ -1,0 +1,17 @@
+[Unit]
+Description=Peephole camera web viewer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/peephole-cam
+# Contains PEEPHOLE_PASSWORD=... (and optionally PEEPHOLE_USER=...)
+EnvironmentFile=/home/pi/peephole-cam/web.env
+ExecStart=/usr/bin/python3 /home/pi/peephole-cam/web_server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
