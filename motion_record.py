@@ -36,6 +36,7 @@ SETTINGS_FILE = OUTPUT_DIR / "settings.json"
 LIVE_FLAG = OUTPUT_DIR / ".live"             # web server touches this while a viewer is watching
 PREVIEW_FILE = OUTPUT_DIR / ".preview.jpg"
 
+DEFAULT_SENSOR_SIZE = (4608, 2592)   # Camera Module 3 (imx708) full pixel array, used for zoom crops
 LORES_SIZE = (320, 240)          # resolution used for motion detection only
 MOTION_POLL_HZ = 5               # lores frames sampled per second while idle
 
@@ -106,7 +107,11 @@ def build_controls(s: dict, sensor_size: tuple[int, int]) -> dict:
 class Recorder:
     def __init__(self) -> None:
         self.picam2 = Picamera2()
-        self.sensor_size = tuple(self.picam2.camera_properties["PixelArraySize"])
+        size = self.picam2.camera_properties.get("PixelArraySize")
+        if size is None:  # libcamera lacks static properties for some sensors (e.g. imx708_wide)
+            size = DEFAULT_SENSOR_SIZE
+            log.warning("Sensor size not reported by libcamera; assuming %s", size)
+        self.sensor_size = tuple(size)
         self.settings = camera_settings.load(SETTINGS_FILE)
         self.settings_mtime = self._file_mtime(SETTINGS_FILE)
         self.applied = dict(self.settings)     # what the hardware is currently set to
