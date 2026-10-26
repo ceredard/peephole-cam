@@ -56,18 +56,24 @@ log.addHandler(_file)
 def enforce_retention(folder: Path, cap_gb: float) -> None:
     """Delete the oldest clips until the folder is back under cap_gb."""
     cap_bytes = cap_gb * 1024 ** 3
-    clips = sorted(folder.glob("*.mp4"), key=lambda p: p.stat().st_mtime)
+    clips = sorted(folder.rglob("*.mp4"), key=lambda p: p.stat().st_mtime)
     total = sum(p.stat().st_size for p in clips)
     while total > cap_bytes and clips:
         oldest = clips.pop(0)
         total -= oldest.stat().st_size
         log.info("Retention: deleting %s to stay under %.1f GB", oldest.name, cap_gb)
         oldest.unlink(missing_ok=True)
+        try:
+            oldest.parent.rmdir()  # only succeeds if the day folder is now empty
+        except OSError:
+            pass
 
 
 def record_clip(picam2: Picamera2, encoder: H264Encoder, duration: int) -> Path:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    clip_path = OUTPUT_DIR / f"door_{timestamp}.mp4"
+    now = datetime.now()
+    day_dir = OUTPUT_DIR / now.strftime("%Y-%m-%d")
+    day_dir.mkdir(exist_ok=True)
+    clip_path = day_dir / f"door_{now.strftime('%Y%m%d_%H%M%S')}.mp4"
     encoder.output = FfmpegOutput(str(clip_path))
 
     log.info("Motion detected - recording %s (%ds)", clip_path.name, duration)

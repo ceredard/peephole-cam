@@ -56,10 +56,34 @@ def requires_auth(view):
 
 # --- Clip helpers ------------------------------------------------------------
 
+def day_dir_for(name: str) -> Path:
+    """Day folder (YYYY-MM-DD) a clip lives in, derived from its filename."""
+    d = name[5:13]
+    return CLIPS_DIR / f"{d[:4]}-{d[4:6]}-{d[6:8]}"
+
+
+def migrate_flat_clips() -> None:
+    """Move clips recorded before per-day folders existed into their day folder."""
+    now = datetime.now().timestamp()
+    for p in CLIPS_DIR.glob("door_*.mp4"):
+        if not CLIP_RE.match(p.name) or now - p.stat().st_mtime < IN_PROGRESS_SECONDS:
+            continue
+        target = day_dir_for(p.name)
+        target.mkdir(exist_ok=True)
+        p.rename(target / p.name)
+
+
+def remove_empty_day_dir(path: Path) -> None:
+    try:
+        path.rmdir()
+    except OSError:
+        pass
+
+
 def list_clips() -> list[dict]:
     now = datetime.now().timestamp()
     clips = []
-    for p in CLIPS_DIR.glob("door_*.mp4"):
+    for p in CLIPS_DIR.glob("*/door_*.mp4"):
         if not CLIP_RE.match(p.name):
             continue
         st = p.stat()
@@ -78,7 +102,7 @@ def clip_path(name: str) -> Path:
     """Resolve a user-supplied clip name, rejecting anything but our own filenames."""
     if not CLIP_RE.match(name):
         abort(404)
-    path = CLIPS_DIR / name
+    path = day_dir_for(name) / name
     if not path.is_file():
         abort(404)
     return path
@@ -87,7 +111,7 @@ def clip_path(name: str) -> Path:
 def prune_thumbs() -> None:
     """Drop thumbnails whose clip was removed by the recorder's retention policy."""
     for t in THUMBS_DIR.glob("*.jpg"):
-        if not (CLIPS_DIR / (t.stem + ".mp4")).exists():
+        if not (day_dir_for(t.stem + ".mp4") / (t.stem + ".mp4")).exists():
             t.unlink(missing_ok=True)
 
 
@@ -118,7 +142,12 @@ PAGE = """<!doctype html>
   .empty { padding:48px 0; text-align:center; }
 </style></head><body>
 <header><h1><a href="{{ url_for('index') }}" style="color:inherit">Peephole cam</a></h1>
-<span class="muted">{{ clips|length }} clip{{ '' if clips|length == 1 else 's' }}</span></header>
+<span class="muted">{{ clips|length }} clip{{ '' if clips|length == 1 else 's' }}
+{% if clips %}
+  <form method="post" action="{{ url_for('delete_all') }}" style="display:inline;margin-left:12px"
+        onsubmit="return confirm('Delete ALL {{ clips|length }} recordings? This cannot be undone.')"><button title="Delete all recordings">Delete all</button></form>
+{% endif %}
+</span></header>
 <main>
 {% if current %}
   <video src="{{ url_for('media', name=current.name) }}" controls autoplay playsinline></video>
@@ -209,8 +238,23 @@ def delete(name: str):
     path = clip_path(name)
     path.unlink(missing_ok=True)
     (THUMBS_DIR / (path.stem + ".jpg")).unlink(missing_ok=True)
+    remove_empty_day_dir(path.parent)
     return redirect(url_for("index"))
 
+
+@app.post("/delete-all")
+@requires_auth
+def delete_all():
+    # list_clips() skips files still being recorded, so an active clip is left alone.
+    for c in list_clips():
+        path = day_dir_for(c["name"]) / c["name"]
+        path.unlink(missing_ok=True)
+        (THUMBS_DIR / (path.stem + ".jpg")).unlink(missing_ok=True)
+        remove_empty_day_dir(path.parent)
+    return redirect(url_for("index"))
+
+
+migrate_flat_clips()
 
 if __name__ == "__main__":
     app.run(host=HOST, port=PORT, threaded=True)
