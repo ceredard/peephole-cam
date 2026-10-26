@@ -203,9 +203,9 @@ def index():
 @app.get("/media/<name>")
 @requires_auth
 def media(name: str):
-    clip_path(name)
+    path = clip_path(name)
     # send_from_directory supports HTTP Range requests, which browsers need to seek.
-    return send_from_directory(CLIPS_DIR, name, mimetype="video/mp4", conditional=True)
+    return send_from_directory(path.parent, name, mimetype="video/mp4", conditional=True)
 
 
 @app.get("/thumb/<name>")
