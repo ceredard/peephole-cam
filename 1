@@ -1,0 +1,84 @@
+[1mdiff --git a/motion_record.py b/motion_record.py[m
+[1mindex 42a20e3..fc9c9ea 100644[m
+[1m--- a/motion_record.py[m
+[1m+++ b/motion_record.py[m
+[36m@@ -16,10 +16,11 @@[m [mimport numpy as np[m
+ from picamera2 import Picamera2[m
+ from picamera2.encoders import H264Encoder[m
+ from picamera2.outputs import FfmpegOutput[m
+[32m+[m[32mfrom libcamera import controls[m
+ [m
+ # --- Configuration ----------------------------------------------------------[m
+ [m
+[31m-OUTPUT_DIR = Path("/home/pi/peephole_clips")[m
+[32m+[m[32mOUTPUT_DIR = Path("/home/cred/peephole_clips")[m
+ LOG_FILE = OUTPUT_DIR / "peephole.log"[m
+ [m
+ CLIP_SECONDS = 30[m
+[36m@@ -33,6 +34,7 @@[m [mMOTION_POLL_HZ = 5               # lores frames sampled per second while idle[m
+ COOLDOWN_SECONDS = 3             # pause after a clip before motion can retrigger[m
+ [m
+ RETENTION_GB = 8.0               # delete oldest clips once this folder exceeds this size[m
+[32m+[m[32mLENS_POSITION = 3.0[m
+ [m
+ # --- Logging -----------------------------------------------------------------[m
+ [m
+[36m@@ -84,6 +86,8 @@[m [mdef main() -> None:[m
+     )[m
+     picam2.configure(config)[m
+     picam2.start()[m
+[32m+[m[32m    picam2.set_controls({"AfMode": controls.AfModeEnum.Manual,[m
+[32m+[m[32m                         "LensPosition": LENS_POSITION})[m
+     log.info([m
+         "Camera started (main=%s, lores=%s). Watching for motion, threshold=%.1f",[m
+         MAIN_SIZE, LORES_SIZE, MOTION_THRESHOLD,[m
+[1mdiff --git a/peephole-cam.service b/peephole-cam.service[m
+[1mindex d09e008..cc1eafc 100644[m
+[1m--- a/peephole-cam.service[m
+[1m+++ b/peephole-cam.service[m
+[36m@@ -4,9 +4,9 @@[m [mAfter=multi-user.target[m
+ [m
+ [Service][m
+ Type=simple[m
+[31m-User=pi[m
+[31m-WorkingDirectory=/home/pi/peephole-cam[m
+[31m-ExecStart=/usr/bin/python3 /home/pi/peephole-cam/motion_record.py[m
+[32m+[m[32mUser=cred[m
+[32m+[m[32mWorkingDirectory=/home/cred/peephole-cam[m
+[32m+[m[32mExecStart=/usr/bin/python3 /home/cred/peephole-cam/motion_record.py[m
+ Restart=on-failure[m
+ RestartSec=5[m
+ [m
+[1mdiff --git a/peephole-web.service b/peephole-web.service[m
+[1mindex 69f1368..ebff36f 100644[m
+[1m--- a/peephole-web.service[m
+[1m+++ b/peephole-web.service[m
+[36m@@ -5,11 +5,11 @@[m [mWants=network-online.target[m
+ [m
+ [Service][m
+ Type=simple[m
+[31m-User=pi[m
+[31m-WorkingDirectory=/home/pi/peephole-cam[m
+[32m+[m[32mUser=cred[m
+[32m+[m[32mWorkingDirectory=/home/cred/peephole-cam[m
+ # Contains PEEPHOLE_PASSWORD=... (and optionally PEEPHOLE_USER=...)[m
+[31m-EnvironmentFile=/home/pi/peephole-cam/web.env[m
+[31m-ExecStart=/usr/bin/python3 /home/pi/peephole-cam/web_server.py[m
+[32m+[m[32mEnvironmentFile=/home/cred/peephole-cam/web.env[m
+[32m+[m[32mExecStart=/usr/bin/python3 /home/cred/peephole-cam/web_server.py[m
+ Restart=on-failure[m
+ RestartSec=5[m
+ [m
+[1mdiff --git a/web_server.py b/web_server.py[m
+[1mindex 052f770..a55bf6c 100644[m
+[1m--- a/web_server.py[m
+[1m+++ b/web_server.py[m
+[36m@@ -18,7 +18,7 @@[m [mfrom flask import Flask, Response, abort, redirect, render_template_string, requ[m
+ [m
+ # --- Configuration ----------------------------------------------------------[m
+ [m
+[31m-CLIPS_DIR = Path("/home/pi/peephole_clips")[m
+[32m+[m[32mCLIPS_DIR = Path("/home/cred/peephole_clips")[m
+ THUMBS_DIR = CLIPS_DIR / ".thumbs"[m
+ HOST = "0.0.0.0"[m
+ PORT = 8080[m

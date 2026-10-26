@@ -18,7 +18,7 @@ from flask import Flask, Response, abort, redirect, render_template_string, requ
 
 # --- Configuration ----------------------------------------------------------
 
-CLIPS_DIR = Path("/home/pi/peephole_clips")
+CLIPS_DIR = Path("/home/cred/peephole_clips")
 THUMBS_DIR = CLIPS_DIR / ".thumbs"
 HOST = "0.0.0.0"
 PORT = 8080

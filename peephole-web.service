@@ -5,11 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=pi
-WorkingDirectory=/home/pi/peephole-cam
+User=cred
+WorkingDirectory=/home/cred/peephole-cam
 # Contains PEEPHOLE_PASSWORD=... (and optionally PEEPHOLE_USER=...)
-EnvironmentFile=/home/pi/peephole-cam/web.env
-ExecStart=/usr/bin/python3 /home/pi/peephole-cam/web_server.py
+EnvironmentFile=/home/cred/peephole-cam/web.env
+ExecStart=/usr/bin/python3 /home/cred/peephole-cam/web_server.py
 Restart=on-failure
 RestartSec=5
 

@@ -16,10 +16,11 @@ import numpy as np
 from picamera2 import Picamera2
 from picamera2.encoders import H264Encoder
 from picamera2.outputs import FfmpegOutput
+from libcamera import controls
 
 # --- Configuration ----------------------------------------------------------
 
-OUTPUT_DIR = Path("/home/pi/peephole_clips")
+OUTPUT_DIR = Path("/home/cred/peephole_clips")
 LOG_FILE = OUTPUT_DIR / "peephole.log"
 
 CLIP_SECONDS = 30
@@ -33,6 +34,7 @@ MOTION_POLL_HZ = 5               # lores frames sampled per second while idle
 COOLDOWN_SECONDS = 3             # pause after a clip before motion can retrigger
 
 RETENTION_GB = 8.0               # delete oldest clips once this folder exceeds this size
+LENS_POSITION = 3.0
 
 # --- Logging -----------------------------------------------------------------
 
@@ -84,6 +86,8 @@ def main() -> None:
     )
     picam2.configure(config)
     picam2.start()
+    picam2.set_controls({"AfMode": controls.AfModeEnum.Manual,
+                         "LensPosition": LENS_POSITION})
     log.info(
         "Camera started (main=%s, lores=%s). Watching for motion, threshold=%.1f",
         MAIN_SIZE, LORES_SIZE, MOTION_THRESHOLD,

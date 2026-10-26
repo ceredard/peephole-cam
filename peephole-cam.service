@@ -4,9 +4,9 @@ After=multi-user.target
 
 [Service]
 Type=simple
-User=pi
-WorkingDirectory=/home/pi/peephole-cam
-ExecStart=/usr/bin/python3 /home/pi/peephole-cam/motion_record.py
+User=cred
+WorkingDirectory=/home/cred/peephole-cam
+ExecStart=/usr/bin/python3 /home/cred/peephole-cam/motion_record.py
 Restart=on-failure
 RestartSec=5
 
