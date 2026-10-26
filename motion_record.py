@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""Motion-triggered 30-second clip recorder for a peephole camera on a Raspberry Pi.
+"""Motion-triggered clip recorder for a peephole camera on a Raspberry Pi.
 
 Watches a low-res preview stream for motion; when movement crosses the
 threshold it records a fixed-length clip from the full-res stream, then goes
 back to watching. Designed to run as a long-lived systemd service.
+
+This is the only process that opens the camera. The web server changes camera
+settings by writing settings.json (see camera_settings.py), which is picked up
+here, and shows a live view from preview frames this process publishes while
+someone is watching.
 """
 
 import logging
 import logging.handlers
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -16,25 +22,26 @@ import numpy as np
 from picamera2 import Picamera2
 from picamera2.encoders import H264Encoder
 from picamera2.outputs import FfmpegOutput
-from libcamera import controls
+from libcamera import Transform, controls
+
+import camera_settings
 
 # --- Configuration ----------------------------------------------------------
+# Tunable values (resolution, clip length, motion threshold, retention, image
+# controls...) and their defaults live in camera_settings.py / settings.json.
 
 OUTPUT_DIR = Path("/home/cred/peephole_clips")
 LOG_FILE = OUTPUT_DIR / "peephole.log"
+SETTINGS_FILE = OUTPUT_DIR / "settings.json"
+LIVE_FLAG = OUTPUT_DIR / ".live"             # web server touches this while a viewer is watching
+PREVIEW_FILE = OUTPUT_DIR / ".preview.jpg"
 
-CLIP_SECONDS = 30
-MAIN_SIZE = (1280, 720)          # resolution of the recorded clip
 LORES_SIZE = (320, 240)          # resolution used for motion detection only
-
-MOTION_THRESHOLD = 7.0           # mean squared pixel difference to count as motion;
-                                  # raise if the hallway light/shadows trigger false
-                                  # positives, lower if real motion is being missed
 MOTION_POLL_HZ = 5               # lores frames sampled per second while idle
-COOLDOWN_SECONDS = 3             # pause after a clip before motion can retrigger
 
-RETENTION_GB = 8.0               # delete oldest clips once this folder exceeds this size
-LENS_POSITION = 3.0
+LIVE_ACTIVE_SECONDS = 5          # preview is published while the flag is this fresh
+PREVIEW_INTERVAL = 0.25          # seconds between preview frames
+PREVIEW_WIDTH = 800
 
 # --- Logging -----------------------------------------------------------------
 
@@ -69,54 +76,193 @@ def enforce_retention(folder: Path, cap_gb: float) -> None:
             pass
 
 
-def record_clip(picam2: Picamera2, encoder: H264Encoder, duration: int) -> Path:
-    now = datetime.now()
-    day_dir = OUTPUT_DIR / now.strftime("%Y-%m-%d")
-    day_dir.mkdir(exist_ok=True)
-    clip_path = day_dir / f"door_{now.strftime('%Y%m%d_%H%M%S')}.mp4"
-    encoder.output = FfmpegOutput(str(clip_path))
+def build_controls(s: dict, sensor_size: tuple[int, int]) -> dict:
+    """Translate settings into libcamera controls."""
+    full_w, full_h = sensor_size
+    crop_w, crop_h = int(full_w / s["zoom"]), int(full_h / s["zoom"])
+    crop_x = int((full_w - crop_w) * s["pan_x"])
+    crop_y = int((full_h - crop_h) * s["pan_y"])
 
-    log.info("Motion detected - recording %s (%ds)", clip_path.name, duration)
-    picam2.start_encoder(encoder)
-    time.sleep(duration)
-    picam2.stop_encoder()
-    log.info("Finished %s", clip_path.name)
-    return clip_path
+    c = {
+        "Brightness": s["brightness"],
+        "Contrast": s["contrast"],
+        "Saturation": s["saturation"],
+        "Sharpness": s["sharpness"],
+        "AeEnable": s["ae_enable"],
+        "AwbMode": getattr(controls.AwbModeEnum, s["awb_mode"]),
+        "AfMode": controls.AfModeEnum.Manual,
+        "LensPosition": s["lens_position"],
+        "ScalerCrop": (crop_x, crop_y, crop_w, crop_h),
+        "NoiseReductionMode": getattr(controls.draft.NoiseReductionModeEnum, s["noise_reduction"]),
+    }
+    if s["ae_enable"]:
+        c["ExposureValue"] = s["exposure_value"]
+    else:
+        c["ExposureTime"] = s["exposure_time_us"]
+        c["AnalogueGain"] = s["analogue_gain"]
+    return c
+
+
+class Recorder:
+    def __init__(self) -> None:
+        self.picam2 = Picamera2()
+        self.sensor_size = tuple(self.picam2.camera_properties["PixelArraySize"])
+        self.settings = camera_settings.load(SETTINGS_FILE)
+        self.settings_mtime = self._file_mtime(SETTINGS_FILE)
+        self.applied = dict(self.settings)     # what the hardware is currently set to
+        self.encoder = H264Encoder()
+        self.last_preview = 0.0
+
+    @staticmethod
+    def _file_mtime(path: Path) -> float | None:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return None
+
+    # -- camera setup --
+
+    def _configure(self) -> None:
+        w, h = (int(v) for v in self.settings["resolution"].split("x"))
+        config = self.picam2.create_video_configuration(
+            main={"size": (w, h)},
+            lores={"size": LORES_SIZE, "format": "YUV420"},
+            transform=Transform(hflip=self.settings["hflip"], vflip=self.settings["vflip"]),
+        )
+        self.picam2.configure(config)
+
+    def _apply_controls(self) -> None:
+        wanted = build_controls(self.settings, self.sensor_size)
+        try:
+            self.picam2.set_controls(wanted)
+        except Exception as exc:  # one control unsupported by this camera/libcamera build
+            log.warning("Setting all controls failed (%s); applying one at a time", exc)
+            for key, value in wanted.items():
+                try:
+                    self.picam2.set_controls({key: value})
+                except Exception as exc:
+                    log.warning("Ignoring control %s=%r: %s", key, value, exc)
+
+    def start(self) -> None:
+        self._configure()
+        self.picam2.start()
+        self._apply_controls()
+        self.applied = dict(self.settings)
+        log.info("Camera started with settings %s", self.settings)
+
+    def _differs(self, kind: str) -> bool:
+        return any(self.settings[f["key"]] != self.applied[f["key"]]
+                   for f in camera_settings.SCHEMA if f["apply"] == kind)
+
+    def _mark_applied(self, kind: str) -> None:
+        for f in camera_settings.SCHEMA:
+            if f["apply"] == kind:
+                self.applied[f["key"]] = self.settings[f["key"]]
+
+    # -- per-tick work: settings reload and live preview --
+
+    def poll(self, can_reconfigure: bool) -> bool:
+        """Pick up settings changes and publish a preview frame if someone is watching.
+
+        Returns True if the picture changed, so the caller should reset its motion baseline.
+        """
+        changed = False
+
+        mtime = self._file_mtime(SETTINGS_FILE)
+        if mtime != self.settings_mtime:
+            self.settings_mtime = mtime
+            new = camera_settings.load(SETTINGS_FILE)
+            if new != self.settings:
+                log.info("Settings changed: %s", {k: v for k, v in new.items() if v != self.settings[k]})
+                self.settings = new
+
+        if can_reconfigure and self._differs("restart"):
+            log.info("Reconfiguring camera (resolution/orientation changed)")
+            self.picam2.stop()
+            self._configure()
+            self.encoder = H264Encoder()
+            self.picam2.start()
+            self._apply_controls()
+            self._mark_applied("restart")
+            self._mark_applied("live")
+            changed = True
+        elif self._differs("live"):
+            self._apply_controls()
+            self._mark_applied("live")
+            changed = True
+
+        self._publish_preview()
+        return changed
+
+    def _publish_preview(self) -> None:
+        now = time.monotonic()
+        if now - self.last_preview < PREVIEW_INTERVAL:
+            return
+        mtime = self._file_mtime(LIVE_FLAG)
+        if mtime is None or time.time() - mtime > LIVE_ACTIVE_SECONDS:
+            return
+        self.last_preview = now
+        try:
+            img = self.picam2.capture_image("main").convert("RGB")
+            img.thumbnail((PREVIEW_WIDTH, PREVIEW_WIDTH))
+            tmp = PREVIEW_FILE.with_name(PREVIEW_FILE.name + ".tmp")
+            img.save(tmp, "JPEG", quality=70)
+            os.replace(tmp, PREVIEW_FILE)
+        except Exception as exc:
+            log.warning("Preview frame failed: %s", exc)
+
+    def wait(self, seconds: float, can_reconfigure: bool) -> None:
+        """Sleep, but keep settings and the live preview serviced."""
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            self.poll(can_reconfigure)
+            time.sleep(0.1)
+
+    # -- recording --
+
+    def record_clip(self) -> Path:
+        duration = self.settings["clip_seconds"]
+        now = datetime.now()
+        day_dir = OUTPUT_DIR / now.strftime("%Y-%m-%d")
+        day_dir.mkdir(exist_ok=True)
+        clip_path = day_dir / f"door_{now.strftime('%Y%m%d_%H%M%S')}.mp4"
+        self.encoder.output = FfmpegOutput(str(clip_path))
+
+        log.info("Motion detected - recording %s (%ds)", clip_path.name, duration)
+        self.picam2.start_encoder(self.encoder)
+        try:
+            # Live controls and preview keep working; resolution changes wait for the clip to end.
+            self.wait(duration, can_reconfigure=False)
+        finally:
+            self.picam2.stop_encoder()
+        log.info("Finished %s", clip_path.name)
+        return clip_path
 
 
 def main() -> None:
-    picam2 = Picamera2()
-    config = picam2.create_video_configuration(
-        main={"size": MAIN_SIZE},
-        lores={"size": LORES_SIZE, "format": "YUV420"},
-    )
-    picam2.configure(config)
-    picam2.start()
-    picam2.set_controls({"AfMode": controls.AfModeEnum.Manual,
-                         "LensPosition": LENS_POSITION})
-    log.info(
-        "Camera started (main=%s, lores=%s). Watching for motion, threshold=%.1f",
-        MAIN_SIZE, LORES_SIZE, MOTION_THRESHOLD,
-    )
+    rec = Recorder()
+    rec.start()
 
-    encoder = H264Encoder()
     w, h = LORES_SIZE
     prev_frame = None
     poll_interval = 1.0 / MOTION_POLL_HZ
 
     try:
         while True:
-            buf = picam2.capture_buffer("lores")
+            if rec.poll(can_reconfigure=True):
+                prev_frame = None  # the picture changed on purpose; don't call that motion
+
+            buf = rec.picam2.capture_buffer("lores")
             # YUV420: the first w*h bytes are the Y (luminance) plane, which is
             # all we need to detect movement cheaply.
             frame = buf[: w * h].reshape(h, w).astype(np.float32)
 
             if prev_frame is not None:
                 mse = float(np.mean((frame - prev_frame) ** 2))
-                if mse > MOTION_THRESHOLD:
-                    record_clip(picam2, encoder, CLIP_SECONDS)
-                    enforce_retention(OUTPUT_DIR, RETENTION_GB)
-                    time.sleep(COOLDOWN_SECONDS)
+                if mse > rec.settings["motion_threshold"]:
+                    rec.record_clip()
+                    enforce_retention(OUTPUT_DIR, rec.settings["retention_gb"])
+                    rec.wait(rec.settings["cooldown_seconds"], can_reconfigure=True)
                     prev_frame = None
                     continue
 
@@ -125,7 +271,7 @@ def main() -> None:
     except KeyboardInterrupt:
         log.info("Stopping on keyboard interrupt")
     finally:
-        picam2.stop()
+        rec.picam2.stop()
 
 
 if __name__ == "__main__":

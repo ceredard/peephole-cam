@@ -10,16 +10,23 @@ import hmac
 import os
 import re
 import subprocess
+import time
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
 
-from flask import Flask, Response, abort, redirect, render_template_string, request, send_from_directory, url_for
+from flask import (Flask, Response, abort, jsonify, redirect, render_template_string, request,
+                   send_from_directory, url_for)
+
+import camera_settings
 
 # --- Configuration ----------------------------------------------------------
 
 CLIPS_DIR = Path("/home/cred/peephole_clips")
 THUMBS_DIR = CLIPS_DIR / ".thumbs"
+SETTINGS_FILE = CLIPS_DIR / "settings.json"   # read by motion_record.py
+LIVE_FLAG = CLIPS_DIR / ".live"               # touched while a live view is open
+PREVIEW_FILE = CLIPS_DIR / ".preview.jpg"     # written by motion_record.py
 HOST = "0.0.0.0"
 PORT = 8080
 
@@ -117,17 +124,15 @@ def prune_thumbs() -> None:
 
 # --- Views -------------------------------------------------------------------
 
-PAGE = """<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Peephole cam</title>
-<style>
+STYLE = """
   :root { color-scheme: light dark; --bg:#fff; --fg:#1a1a1a; --card:#f2f2f4; --muted:#777; --accent:#2a6df4; }
   @media (prefers-color-scheme: dark) { :root { --bg:#111; --fg:#eee; --card:#1d1d20; --muted:#999; --accent:#6a9cff; } }
   body { margin:0; background:var(--bg); color:var(--fg); font:16px system-ui, sans-serif; }
-  header { padding:16px; display:flex; justify-content:space-between; align-items:baseline; }
+  header { padding:16px; display:flex; justify-content:space-between; align-items:baseline; gap:16px; flex-wrap:wrap; }
   h1 { margin:0; font-size:1.25rem; }
+  nav.tabs { display:flex; gap:16px; flex:1; }
+  nav.tabs a { color:var(--muted); padding-bottom:2px; }
+  nav.tabs a.active { color:var(--fg); border-bottom:2px solid var(--accent); }
   .muted { color:var(--muted); font-size:.875rem; }
   main { padding:0 16px 32px; max-width:1100px; margin:0 auto; }
   h2 { font-size:1rem; margin:24px 0 8px; color:var(--muted); font-weight:600; }
@@ -140,8 +145,34 @@ PAGE = """<!doctype html>
   button { font:inherit; background:none; border:0; color:#d33; cursor:pointer; padding:4px; }
   video { width:100%; max-height:70vh; background:#000; border-radius:8px; }
   .empty { padding:48px 0; text-align:center; }
-</style></head><body>
+  .live { display:grid; grid-template-columns:minmax(0, 2fr) minmax(260px, 1fr); gap:16px; align-items:start; }
+  @media (max-width: 800px) { .live { grid-template-columns:1fr; } }
+  .live img.view { width:100%; aspect-ratio:16/9; background:#000; border-radius:8px; display:block; }
+  #settings { background:var(--card); border-radius:8px; padding:4px 12px 12px; }
+  #settings fieldset { border:0; padding:0; margin:12px 0 0; }
+  #settings legend { color:var(--muted); font-weight:600; font-size:.875rem; padding:0; margin-bottom:4px; }
+  #settings label { display:block; margin:8px 0; font-size:.875rem; }
+  #settings .row { display:flex; align-items:center; gap:8px; }
+  #settings input[type=range] { flex:1; min-width:0; }
+  #settings output { min-width:3.5em; text-align:right; font-variant-numeric:tabular-nums; }
+  #settings select { font:inherit; width:100%; }
+  .tools { display:flex; justify-content:space-between; align-items:center; padding-top:12px; }
+  .tools button { color:var(--accent); }
+"""
+
+NAV = """<nav class="tabs">
+  <a href="{{ url_for('index') }}" class="{{ 'active' if tab == 'clips' }}">Clips</a>
+  <a href="{{ url_for('live') }}" class="{{ 'active' if tab == 'live' }}">Live &amp; settings</a>
+</nav>"""
+
+PAGE = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Peephole cam</title>
+<style>{{ style|safe }}</style></head><body>
 <header><h1><a href="{{ url_for('index') }}" style="color:inherit">Peephole cam</a></h1>
+""" + NAV + """
 <span class="muted">{{ clips|length }} clip{{ '' if clips|length == 1 else 's' }}
 {% if clips %}
   <form method="post" action="{{ url_for('delete_all') }}" style="display:inline;margin-left:12px"
@@ -197,7 +228,153 @@ def index():
     selected = request.args.get("clip", "")
     if selected:
         current = next((c for c in clips if c["name"] == selected), None)
-    return render_template_string(PAGE, clips=clips, days=days, current=current)
+    return render_template_string(PAGE, clips=clips, days=days, current=current, style=STYLE, tab="clips")
+
+
+LIVE_PAGE = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Peephole cam - live</title>
+<style>{{ style|safe }}</style></head><body>
+<header><h1><a href="{{ url_for('index') }}" style="color:inherit">Peephole cam</a></h1>
+""" + NAV + """
+<span class="muted" id="status"></span></header>
+<main><div class="live">
+  <div>
+    <img class="view" src="{{ url_for('live_stream') }}" alt="Live view">
+    <p class="muted">Live view is a few frames per second and lower resolution than the recorded clips.
+    Settings marked &#8635; apply after the current clip finishes.</p>
+  </div>
+  <form id="settings" onsubmit="return false">
+  {% for group, fields in groups %}
+    <fieldset><legend>{{ group }}</legend>
+    {% for f in fields %}
+      <label>{{ f.label }}{{ ' ↻' if f.apply == 'restart' }}
+      {% if f.type == 'bool' %}
+        <input type="checkbox" name="{{ f.key }}" {{ 'checked' if values[f.key] }}>
+      {% elif f.type == 'enum' %}
+        <select name="{{ f.key }}">
+        {% for o in f.options %}<option {{ 'selected' if values[f.key] == o }}>{{ o }}</option>{% endfor %}
+        </select>
+      {% else %}
+        <span class="row">
+          <input type="range" name="{{ f.key }}" min="{{ f.min }}" max="{{ f.max }}" step="{{ f.step }}" value="{{ values[f.key] }}">
+          <output>{{ values[f.key] }}</output>
+        </span>
+      {% endif %}
+      </label>
+    {% endfor %}
+    </fieldset>
+  {% endfor %}
+    <div class="tools"><button type="button" id="reset">Reset to defaults</button></div>
+  </form>
+</div></main>
+<script>
+  const form = document.getElementById('settings');
+  const status = document.getElementById('status');
+  let timer;
+
+  function collect() {
+    const out = {};
+    for (const el of form.elements) {
+      if (!el.name) continue;
+      out[el.name] = el.type === 'checkbox' ? el.checked : el.type === 'range' ? Number(el.value) : el.value;
+    }
+    return out;
+  }
+
+  function fill(values) {
+    for (const el of form.elements) {
+      if (!el.name || !(el.name in values)) continue;
+      if (el.type === 'checkbox') el.checked = values[el.name];
+      else el.value = values[el.name];
+      if (el.type === 'range') el.nextElementSibling.value = el.value;
+    }
+  }
+
+  async function post(url, body) {
+    status.textContent = 'Saving…';
+    try {
+      const r = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                   body: JSON.stringify(body || {})});
+      if (!r.ok) throw new Error(r.status);
+      status.textContent = 'Saved';
+      return await r.json();
+    } catch (e) {
+      status.textContent = 'Save failed';
+    }
+  }
+
+  form.addEventListener('input', (e) => {
+    if (e.target.type === 'range') e.target.nextElementSibling.value = e.target.value;
+    clearTimeout(timer);
+    timer = setTimeout(() => post("{{ url_for('save_settings') }}", collect()), 150);
+  });
+
+  document.getElementById('reset').addEventListener('click', async () => {
+    if (!confirm('Reset all camera settings to defaults?')) return;
+    const values = await post("{{ url_for('reset_settings') }}");
+    if (values) fill(values);
+  });
+</script>
+</body></html>
+"""
+
+
+@app.get("/live")
+@requires_auth
+def live():
+    groups: dict[str, list[dict]] = {}
+    for f in camera_settings.SCHEMA:
+        groups.setdefault(f["group"], []).append(f)
+    return render_template_string(
+        LIVE_PAGE, style=STYLE, tab="live", groups=list(groups.items()),
+        values=camera_settings.load(SETTINGS_FILE),
+    )
+
+
+@app.get("/live/stream")
+@requires_auth
+def live_stream():
+    """MJPEG stream built from preview frames the recorder publishes while LIVE_FLAG is fresh."""
+    def frames():
+        try:
+            last = PREVIEW_FILE.stat().st_mtime_ns   # skip any stale frame left from a previous viewer
+        except OSError:
+            last = None
+        while True:
+            LIVE_FLAG.touch()
+            try:
+                mtime = PREVIEW_FILE.stat().st_mtime_ns
+                if mtime != last:
+                    data = PREVIEW_FILE.read_bytes()
+                    last = mtime
+                    yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                           + str(len(data)).encode() + b"\r\n\r\n" + data + b"\r\n")
+            except OSError:
+                pass
+            time.sleep(0.1)
+
+    return Response(frames(), mimetype="multipart/x-mixed-replace; boundary=frame",
+                    headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+
+@app.post("/live/settings")
+@requires_auth
+def save_settings():
+    changes = request.get_json(silent=True)
+    if not isinstance(changes, dict):
+        abort(400)
+    # clean() drops unknown keys and clamps values, so the form can't push anything invalid.
+    saved = camera_settings.save(SETTINGS_FILE, {**camera_settings.load(SETTINGS_FILE), **changes})
+    return jsonify(saved)
+
+
+@app.post("/live/settings/reset")
+@requires_auth
+def reset_settings():
+    return jsonify(camera_settings.save(SETTINGS_FILE, camera_settings.defaults()))
 
 
 @app.get("/media/<name>")
