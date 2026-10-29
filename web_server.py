@@ -183,11 +183,29 @@ PAGE = """<!doctype html>
 {% if current %}
   <video src="{{ url_for('media', name=current.name) }}" controls autoplay playsinline></video>
   <div class="meta">
+    {% if older %}<a id="prev" href="{{ url_for('index', clip=older.name) }}" title="Older (left arrow)">&#8249; Older</a>{% else %}<span class="muted">&#8249; Older</span>{% endif %}
     <strong>{{ current.when.strftime('%A %d %B %Y, %H:%M:%S') }}</strong>
-    <span>
-      <a href="{{ url_for('media', name=current.name) }}" download>Download</a>
-    </span>
+    {% if newer %}<a id="next" href="{{ url_for('index', clip=newer.name) }}" title="Newer (right arrow)">Newer &#8250;</a>{% else %}<span class="muted">Newer &#8250;</span>{% endif %}
   </div>
+  <div class="meta"><span></span>
+    <a href="{{ url_for('media', name=current.name) }}" download>Download</a>
+  </div>
+  <script>
+    document.addEventListener('keydown', e => {
+      if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      const link = document.getElementById(e.key === 'ArrowLeft' ? 'prev' : e.key === 'ArrowRight' ? 'next' : '');
+      if (link) { e.preventDefault(); location.href = link.href; }
+    }, true);
+    let sx = null;
+    const v = document.querySelector('video');
+    v.addEventListener('touchstart', e => { sx = e.touches[0].clientX; }, {passive: true});
+    v.addEventListener('touchend', e => {
+      if (sx === null) return;
+      const dx = e.changedTouches[0].clientX - sx; sx = null;
+      const link = document.getElementById(dx > 80 ? 'prev' : dx < -80 ? 'next' : '');
+      if (link) location.href = link.href;
+    }, {passive: true});
+  </script>
 {% endif %}
 {% if not clips %}
   <p class="empty muted">No clips yet.</p>
@@ -224,11 +242,17 @@ def index():
             days.append((label, []))
         days[-1][1].append(c)
 
-    current = None
+    current = older = newer = None
     selected = request.args.get("clip", "")
     if selected:
-        current = next((c for c in clips if c["name"] == selected), None)
-    return render_template_string(PAGE, clips=clips, days=days, current=current, style=STYLE, tab="clips")
+        # clips are sorted newest first, so the next index is the older clip
+        i = next((n for n, c in enumerate(clips) if c["name"] == selected), None)
+        if i is not None:
+            current = clips[i]
+            newer = clips[i - 1] if i > 0 else None
+            older = clips[i + 1] if i + 1 < len(clips) else None
+    return render_template_string(PAGE, clips=clips, days=days, current=current, older=older,
+                                  newer=newer, style=STYLE, tab="clips")
 
 
 LIVE_PAGE = """<!doctype html>
